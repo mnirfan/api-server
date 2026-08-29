@@ -2,17 +2,11 @@ package main
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -29,9 +23,20 @@ type APIResponse struct {
 	Message string `json:"message"`
 }
 
+type APILikeWidgetRequest struct {
+	Count int `json:"count"`
+}
+
+type APIWidgetResponse struct {
+	Success bool         `json:"status"`
+	Message string       `json:"message"`
+	Data    *WidgetState `json:"data,omitempty"`
+}
+
 type Application struct {
-	redis  *redis.Client
-	secret []byte
+	redis          *redis.Client
+	secret         []byte
+	widgetRegistry WidgetsRegistry
 }
 
 type ctxKey string
@@ -65,14 +70,33 @@ func main() {
 
 	rdb := redis.NewClient(opt)
 
+	// Widget Registration
+	wr := NewWidgetRegistry()
+
 	app := &Application{
-		redis:  rdb,
-		secret: []byte(secretKey),
+		redis:          rdb,
+		secret:         []byte(secretKey),
+		widgetRegistry: wr,
 	}
 
-	http.HandleFunc("/user", getUser)
-	http.Handle("/health", app.anonIDMiddleware(http.HandlerFunc(app.pingHandler)))
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	// Like widget
+	likeWidget := LikeWidget{
+		name:  "like-widget",
+		redis: app.redis,
+	}
+
+	wr.Register("like-widget", &likeWidget)
+
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /user", getUser)
+	mux.Handle("GET /health", app.anonIDMiddleware(http.HandlerFunc(app.pingHandler)))
+	mux.Handle("GET /widgets/{type}/{slug}", app.anonIDMiddleware(http.HandlerFunc(app.getLikeStateHandler)))
+	mux.Handle("POST /widgets/{type}/{slug}/hit", app.anonIDMiddleware(http.HandlerFunc(app.hitLikeHandler)))
+
+	if err := http.ListenAndServe(":8080", mux); err != nil {
+		fmt.Println("Error running server:", err)
+	}
 
 }
 
@@ -103,90 +127,91 @@ func (app *Application) pingHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-func signAnonID(id string, secret []byte) string {
-	mac := hmac.New(sha256.New, secret)
-	mac.Write([]byte(id))
-	sig := hex.EncodeToString(mac.Sum(nil))
-	return id + "." + sig
-}
-
-func verifyAnonID(signed string, secret []byte) (id string, ok bool) {
-	data := strings.Split(signed, ".")
-	if len(data) < 2 {
-		return data[0], false
+func (app *Application) hitLikeHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	response := APIWidgetResponse{
+		Success: false,
+		Message: "error",
+		Data:    nil,
 	}
 
-	expectedMac, err := hex.DecodeString(data[1])
+	widgetType := r.PathValue("type")
+	widget := app.widgetRegistry.Get(widgetType)
+	if widget == nil {
+		w.WriteHeader(http.StatusNotFound)
+		response.Message = "widget not found"
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+	anonID, ok := anonIDFromContext(r)
+	if !ok {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	var requestBody APILikeWidgetRequest
+	if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		response.Message = "invalid parameters"
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	state, err := widget.Hit(r.Context(), r.PathValue("slug"), anonID, requestBody.Count)
+	if errors.Is(err, ErrInvalidCount) {
+		w.WriteHeader(http.StatusBadRequest)
+		response.Message = err.Error()
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
 	if err != nil {
-		return data[0], false
+		w.WriteHeader(http.StatusInternalServerError)
+		response.Message = err.Error()
+		json.NewEncoder(w).Encode(response)
+		return
 	}
 
-	expectedID := data[0]
-
-	mac := hmac.New(sha256.New, secret)
-	mac.Write([]byte(expectedID))
-	computedMac := mac.Sum(nil)
-
-	equal := hmac.Equal(expectedMac, computedMac)
-	return data[0], equal
+	response.Message = "ok"
+	response.Data = &state
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
 }
 
-func generateAnonIDCookie(secret []byte) (string, *http.Cookie) {
-	id := signAnonID(rand.Text(), secret)
-
-	// Set cookie
-	anonIDCookie := &http.Cookie{
-		Name:     "anonid",
-		Value:    id,
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteNoneMode,
-		MaxAge:   30 * 24 * 60 * 60,
-		Path:     "/",
+func (app *Application) getLikeStateHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	response := APIWidgetResponse{
+		Success: false,
+		Message: "error",
+		Data:    nil,
 	}
 
-	return id, anonIDCookie
-}
+	widgetType := r.PathValue("type")
+	widget := app.widgetRegistry.Get(widgetType)
+	if widget == nil {
+		w.WriteHeader(http.StatusNotFound)
+		response.Message = "widget not found"
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+	anonID, ok := anonIDFromContext(r)
+	if !ok {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(response)
+		return
+	}
 
-func anonIDFromContext(r *http.Request) (string, bool) {
-	anonID, ok := r.Context().Value(anonIDKey).(string)
-	return anonID, ok
-}
+	state, err := widget.State(r.Context(), r.PathValue("slug"), anonID)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		response.Message = err.Error()
+		json.NewEncoder(w).Encode(response)
+		return
+	}
 
-func (app *Application) anonIDMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cookie, err := r.Cookie("anonid")
-		if err != nil {
-			switch {
-			case errors.Is(err, http.ErrNoCookie):
-				id, anonIDCookie := generateAnonIDCookie(app.secret)
-				http.SetCookie(w, anonIDCookie)
-
-				newR := r.WithContext(context.WithValue(r.Context(), anonIDKey, id))
-				next.ServeHTTP(w, newR)
-				return
-			default:
-				response := APIResponse{
-					Success: false,
-					Message: "Error reading cookie",
-				}
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusInternalServerError)
-				json.NewEncoder(w).Encode(response)
-				return
-			}
-		}
-
-		anonID, ok := verifyAnonID(cookie.Value, app.secret)
-		if !ok {
-			id, anonIDCookie := generateAnonIDCookie(app.secret)
-			newR := r.WithContext(context.WithValue(r.Context(), anonIDKey, id))
-			http.SetCookie(w, anonIDCookie)
-			next.ServeHTTP(w, newR)
-			return
-		}
-
-		newR := r.WithContext(context.WithValue(r.Context(), anonIDKey, anonID))
-		next.ServeHTTP(w, newR)
-	})
+	response.Message = "ok"
+	response.Data = &state
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
 }
