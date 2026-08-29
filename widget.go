@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -56,6 +56,10 @@ func (likeWidget *LikeWidget) GenerateSessionKey(slug string, anonID string) str
 	return "widget:" + likeWidget.name + ":" + slug + ":user:" + anonID
 }
 
+func (likeWidget *LikeWidget) GenerateGlobalKey(slug string) string {
+	return "widget:" + likeWidget.name + ":" + slug + ":global"
+}
+
 func (likeWidget *LikeWidget) Validate(slug string) error {
 	// allow all for now
 	return nil
@@ -63,76 +67,68 @@ func (likeWidget *LikeWidget) Validate(slug string) error {
 
 func (likeWidget *LikeWidget) Hit(ctx context.Context, slug string, anonID string, count int) (WidgetState, error) {
 	if count < 1 {
-
 		return WidgetState{}, ErrInvalidCount
 	}
 
-	redisKey := likeWidget.GenerateSessionKey(slug, anonID)
-	val, err := likeWidget.redis.Get(ctx, redisKey).Result()
-	if errors.Is(err, redis.Nil) {
-		minCount := min(count, LIKE_MAX_PER_ANON_ID)
-		newState := WidgetState{
-			Count:     minCount,
-			Capped:    minCount >= LIKE_MAX_PER_ANON_ID,
-			Remaining: LIKE_MAX_PER_ANON_ID - minCount,
-		}
+	redisGlobalKey := likeWidget.GenerateGlobalKey(slug)
+	redisSessionKey := likeWidget.GenerateSessionKey(slug, anonID)
 
-		jsonRes, err := json.Marshal(newState)
-		if err != nil {
-			return newState, errors.New("Can't marshal new state")
-		}
+	var incrBy = redis.NewScript(`
+		local sessionKey = KEYS[1]
+		local globalKey = KEYS[2]
+		local change = ARGV[1]
+		local cap = ARGV[2]
+		local ttl = ARGV[3]
 
-		_, setErr := likeWidget.redis.Set(ctx, redisKey, jsonRes, LIKE_TTL_PER_ANON_ID).Result()
-		if setErr != nil {
-			return newState, errors.New("Can't update count data")
-		}
-		return newState, nil
-	}
-	if err != nil {
-		// redis is down
-		newState := WidgetState{
-			Count:     0,
-			Capped:    true,
-			Remaining: 0,
-		}
-		return newState, errors.New("Can't get count data")
-	}
+		local globalValue = redis.call("GET", globalKey)
+		globalValue = tonumber(globalValue or 0)
 
-	var res WidgetState
-	if err := json.Unmarshal([]byte(val), &res); err != nil {
-		res = WidgetState{}
-	}
+		local sessionValue = redis.call("GET", sessionKey)
+		sessionValue = tonumber(sessionValue or 0)
 
-	res.Count += min(count, res.Remaining)
-	res.Capped = res.Count >= LIKE_MAX_PER_ANON_ID
-	res.Remaining = LIKE_MAX_PER_ANON_ID - res.Count
+		local remaining = cap - sessionValue
+		change = math.min(change, remaining)
 
-	jsonRes, err := json.Marshal(res)
-	if err != nil {
-		return res, errors.New("Can't marshal new state")
-	}
+		globalValue = globalValue + change
+		sessionValue = sessionValue + change
+		redis.call("SET", globalKey, globalValue)
+		redis.call("SET", sessionKey, sessionValue)
+		redis.call("EXPIRE", sessionKey, ttl)
 
-	_, updateError := likeWidget.redis.Set(ctx, redisKey, jsonRes, LIKE_TTL_PER_ANON_ID).Result()
+		return {globalValue, sessionValue}
+	`)
 
+	keys := []string{redisSessionKey, redisGlobalKey}
+	values := []interface{}{count, LIKE_MAX_PER_ANON_ID, int(LIKE_TTL_PER_ANON_ID.Seconds())}
+	countResults, updateError := incrBy.Run(ctx, likeWidget.redis, keys, values...).Result()
 	if updateError != nil {
-		return res, updateError
+		return WidgetState{}, updateError
+	}
+
+	countResultSlice, ok := countResults.([]any)
+	if !ok {
+		return WidgetState{}, errors.New("Failed to get count update")
+	}
+
+	globalCount := int(countResultSlice[0].(int64))
+	sessionCount := int(countResultSlice[1].(int64))
+	sessionRemaining := LIKE_MAX_PER_ANON_ID - sessionCount
+	capped := sessionRemaining < 1
+
+	res := WidgetState{
+		Count:     globalCount,
+		Remaining: sessionRemaining,
+		Capped:    capped,
 	}
 
 	return res, nil
 }
 
 func (likeWidget *LikeWidget) State(ctx context.Context, slug string, anonID string) (WidgetState, error) {
-	redisKey := likeWidget.GenerateSessionKey(slug, anonID)
-	val, err := likeWidget.redis.Get(ctx, redisKey).Result()
-	if errors.Is(err, redis.Nil) {
-		newState := WidgetState{
-			Count:     0,
-			Capped:    false,
-			Remaining: LIKE_MAX_PER_ANON_ID,
-		}
+	redisGlobalKey := likeWidget.GenerateGlobalKey(slug)
+	redisSessionKey := likeWidget.GenerateSessionKey(slug, anonID)
 
-		return newState, nil
-	}
+	countResults, err := likeWidget.redis.MGet(ctx, redisGlobalKey, redisSessionKey).Result()
 	if err != nil {
 		newState := WidgetState{
 			Count:     0,
@@ -142,9 +138,33 @@ func (likeWidget *LikeWidget) State(ctx context.Context, slug string, anonID str
 		return newState, errors.New("Can't get count data")
 	}
 
-	var res WidgetState
-	if err := json.Unmarshal([]byte(val), &res); err != nil {
-		res = WidgetState{}
+	globalCountStr, globalCountStrOk := countResults[0].(string)
+	if !globalCountStrOk {
+		globalCountStr = "0"
+	}
+
+	sessionCountStr, sessionCountStrOk := countResults[1].(string)
+	if !sessionCountStrOk {
+		sessionCountStr = "0"
+	}
+
+	globalCount, globalCountErr := strconv.Atoi(globalCountStr)
+	if globalCountErr != nil {
+		return WidgetState{}, errors.New("Failed to parse global count data")
+	}
+
+	sessionCount, sessionCountErr := strconv.Atoi(sessionCountStr)
+	if sessionCountErr != nil {
+		return WidgetState{}, errors.New("Failed to parse session count data")
+	}
+
+	remaining := LIKE_MAX_PER_ANON_ID - sessionCount
+	capped := remaining < 1
+
+	res := WidgetState{
+		Count:     globalCount,
+		Capped:    capped,
+		Remaining: remaining,
 	}
 
 	return res, nil

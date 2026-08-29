@@ -19,7 +19,7 @@ type User struct {
 }
 
 type APIResponse struct {
-	Success bool   `json:"status"`
+	Success bool   `json:"success"`
 	Message string `json:"message"`
 }
 
@@ -28,7 +28,7 @@ type APILikeWidgetRequest struct {
 }
 
 type APIWidgetResponse struct {
-	Success bool         `json:"status"`
+	Success bool         `json:"success"`
 	Message string       `json:"message"`
 	Data    *WidgetState `json:"data,omitempty"`
 }
@@ -173,6 +173,7 @@ func (app *Application) hitLikeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	response.Success = true
 	response.Message = "ok"
 	response.Data = &state
 	w.WriteHeader(http.StatusOK)
@@ -210,6 +211,7 @@ func (app *Application) getLikeStateHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	response.Success = true
 	response.Message = "ok"
 	response.Data = &state
 	w.WriteHeader(http.StatusOK)
