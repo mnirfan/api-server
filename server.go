@@ -37,19 +37,20 @@ type Application struct {
 	redis          *redis.Client
 	secret         []byte
 	widgetRegistry WidgetsRegistry
+	allowedOrigin  string
 }
 
 type ctxKey string
 
+type Middleware func(http.Handler) http.Handler
+
 const anonIDKey ctxKey = "anonID"
 
-func getUser(w http.ResponseWriter, r *http.Request) {
-	user := User{ID: 1, Name: "Nurul"}
-	w.Header().Set("Content-Type", "application/json")
-
-	if err := json.NewEncoder(w).Encode(user); err != nil {
-		http.Error(w, "failed to encode response", http.StatusInternalServerError)
+func Chain(h http.Handler, middlewares ...Middleware) http.Handler {
+	for i := len(middlewares) - 1; i >= 0; i-- {
+		h = middlewares[i](h)
 	}
+	return h
 }
 
 func main() {
@@ -60,7 +61,12 @@ func main() {
 
 	secretKey := os.Getenv("SECRET_KEY")
 	if secretKey == "" || len(secretKey) < 15 {
-		panic("secret key not valid")
+		panic("[env] secret key is not valid")
+	}
+
+	allowedOrigin := os.Getenv("ALLOWED_ORIGIN")
+	if allowedOrigin == "" {
+		panic("[env] allowed origin is not valid")
 	}
 
 	opt, err := redis.ParseURL("redis://localhost:6379/0")
@@ -77,6 +83,7 @@ func main() {
 		redis:          rdb,
 		secret:         []byte(secretKey),
 		widgetRegistry: wr,
+		allowedOrigin:  allowedOrigin,
 	}
 
 	// Like widget
@@ -89,10 +96,9 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /user", getUser)
-	mux.Handle("GET /health", app.anonIDMiddleware(http.HandlerFunc(app.pingHandler)))
-	mux.Handle("GET /widgets/{type}/{slug}", app.anonIDMiddleware(http.HandlerFunc(app.getLikeStateHandler)))
-	mux.Handle("POST /widgets/{type}/{slug}/hit", app.anonIDMiddleware(http.HandlerFunc(app.hitLikeHandler)))
+	mux.Handle("GET /health", http.HandlerFunc(app.pingHandler))
+	mux.Handle("GET /widgets/{type}/{slug}", Chain(http.HandlerFunc(app.getLikeStateHandler), app.csrfMiddleware, app.anonIDMiddleware))
+	mux.Handle("POST /widgets/{type}/{slug}/hit", Chain(http.HandlerFunc(app.hitLikeHandler), app.csrfMiddleware, app.anonIDMiddleware))
 
 	if err := http.ListenAndServe(":8080", mux); err != nil {
 		fmt.Println("Error running server:", err)
