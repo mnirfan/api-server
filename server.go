@@ -96,14 +96,30 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	mux.Handle("GET /health", Chain(http.HandlerFunc(app.pingHandler), app.ipRateLimitMiddleware))
-	mux.Handle("GET /widgets/{type}/{slug}", Chain(http.HandlerFunc(app.getLikeStateHandler), app.csrfMiddleware, app.ipRateLimitMiddleware, app.anonIDMiddleware, app.rateLimitMiddleware))
-	mux.Handle("POST /widgets/{type}/{slug}/hit", Chain(http.HandlerFunc(app.hitLikeHandler), app.csrfMiddleware, app.ipRateLimitMiddleware, app.anonIDMiddleware, app.rateLimitMiddleware))
+	mux.Handle("OPTIONS /", http.HandlerFunc(app.optionsHandler))
+
+	mux.Handle("GET /health", Chain(http.HandlerFunc(app.pingHandler), app.corsMiddleware, app.ipRateLimitMiddleware))
+	mux.Handle("GET /widgets/{type}/{slug}", Chain(http.HandlerFunc(app.getLikeStateHandler), app.corsMiddleware, app.csrfMiddleware, app.ipRateLimitMiddleware, app.anonIDMiddleware, app.rateLimitMiddleware))
+	mux.Handle("POST /widgets/{type}/{slug}/hit", Chain(http.HandlerFunc(app.hitLikeHandler), app.corsMiddleware, app.csrfMiddleware, app.ipRateLimitMiddleware, app.anonIDMiddleware, app.rateLimitMiddleware))
 
 	if err := http.ListenAndServe(":8080", mux); err != nil {
 		fmt.Println("Error running server:", err)
 	}
 
+}
+
+func (app *Application) optionsHandler(w http.ResponseWriter, r *http.Request) {
+	origin := r.Header.Get("Origin")
+	if origin != app.allowedOrigin {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+
+	w.Header().Set("Access-Control-Allow-Origin", app.allowedOrigin)
+	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Credentials", "true")
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (app *Application) pingHandler(w http.ResponseWriter, r *http.Request) {
