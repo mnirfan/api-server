@@ -1,0 +1,273 @@
+LEARNING LOG — Playful Widgets API (Go + REST + WS + Redis)
+Project: api-server (blog widgets backend, learning-focused)
+Mentor-guided build. Log kept in reverse-chronological-topic order (by feature, not by date).
+
+================================================================
+1. PROJECT SETUP — walking skeleton
+================================================================
+- Built /health first: pings Redis, proves the whole chain (HTTP -> Go -> Redis) works
+  before adding real features.
+- Bugs found & fixed:
+  - Missing `return` after writing an error response -> fell through and wrote a
+    second JSON body to the same ResponseWriter (double-write, wrong status code).
+  - Missing explicit `w.WriteHeader(500)` on the error path -> client always saw 200
+    even when Redis was down. Lesson: default HTTP status is 200 unless you say
+    otherwise.
+  - Used `context.Background()` for the Redis call instead of `r.Context()` -> Redis
+    call wouldn't cancel if the client disconnected.
+  - No timeout on the Redis call at all -> could hang forever if Redis was slow but
+    not fully down. Fixed with `context.WithTimeout(r.Context(), ...)`.
+- Concept: default to no timeout/no cancellation in Go network calls unless you wire
+  it up yourself — nothing does it for you.
+
+================================================================
+2. ANONYMOUS IDENTITY — HMAC-signed cookie + middleware
+================================================================
+- Design: signed cookie (anonID + "." + HMAC-SHA256 signature), issued if missing,
+  verified on every request, treated as "identity" for cap tracking.
+- Concept: HMAC proves a value came from the server (has the secret) and wasn't
+  tampered with. Plain hashing doesn't — anyone can hash, only the server can sign.
+- Bugs found & fixed (roughly in order found):
+  - Nil pointer panic: `r.Cookie()` returns `(nil, ErrNoCookie)` on a missing cookie —
+    used `cookie.Value` on the nil pointer anyway in a later code path.
+  - Verified the ID portion against a hex-decode, but the ID was never hex-encoded in
+    the first place (only the signature was) — verification always failed for real
+    cookies.
+  - Unchecked slice index after `strings.Split` — a cookie value with no "." in it
+    (attacker-controlled input) caused an index-out-of-range panic.
+  - Cookie was being "set" as a raw string via `Set-Cookie` header instead of
+    `http.SetCookie` + `http.Cookie{}` — missing `Secure`/`HttpOnly`/`SameSite`/MaxAge
+    entirely, and not even correctly named (no `anonid=` prefix).
+  - `r.WithContext(...)`'s return value was discarded (called but not reassigned) —
+    context propagation silently did nothing for several iterations. `WithContext`
+    returns a *new* request; the original is untouched.
+  - The verified anon ID was silently discarded (`_, ok := verifyAnonID(...)`) on the
+    *common* path (valid returning cookie) — only the exceptional paths even attempted
+    propagation, and those were broken by the bug above too.
+  - Secret key was never actually set on `Application` for several rounds — HMAC ran
+    against a nil/empty key, meaning signatures were trivially forgeable.
+  - `godotenv.Load()`'s error was silently swallowed via variable-reuse before being
+    checked deliberately.
+- Concept: constant-time comparison (`hmac.Equal`) instead of `==`/`bytes.Equal` to
+  avoid timing attacks on signature verification.
+- Concept: context propagation as the mechanism for "middleware learned X, a handler
+  three layers down needs X" — `context.WithValue` + an unexported key type to avoid
+  cross-package key collisions.
+
+================================================================
+3. WIDGET REGISTRY & INTERFACE
+================================================================
+- Design decision (deliberated, not assumed): kept a narrow interface
+  (`Validate`/`Hit`/`State` returning a fixed `WidgetState{count, capped, remaining}`)
+  scoped to counter-style widgets, rather than generalizing for hypothetical future
+  widget types (poll, reactions) with no concrete second widget in hand yet. Reasoning:
+  Go interfaces are cheap to widen later once a real second case exists to design
+  against; guessing now would be pure speculation.
+- `WidgetsRegistry` built as its own type (`Register`/`Get` methods) instead of a bare
+  map field on `Application` — encapsulation boundary, even with only one widget type
+  registered.
+- Bugs/gaps found & fixed:
+  - Registry had `Register` but no `Get` — callers reached directly into the internal
+    map field, bypassing the abstraction that was supposedly the point of wrapping it.
+  - `LikeWidget` originally embedded the *entire* `Application` (redis client, secret,
+    even the registry itself) by value, when it only ever used `.redis`. Narrowed to
+    just `redis *redis.Client` — smaller dependency surface, easier to test in
+    isolation, correct dependency direction (widget depends on Redis, not on the app
+    that depends on the widget).
+
+================================================================
+4. LIKE-BUTTON HIT LOGIC — accumulation, capping, validation
+================================================================
+- Core bug (most severe of the whole project so far): `Hit` correctly created state on
+  the *first* hit but on every hit after that, just read back and returned the old
+  state unchanged — the accumulate/clamp logic was never written for the "existing
+  key" branch. The entire point of the widget (accumulate up to a cap) silently did
+  nothing past hit #1.
+- `redis.Nil` (key missing) vs a real connection error were being treated identically
+  — a transient Redis error would be misread as "no prior data," at one point risking
+  actual state resets on a lucky-timed failure.
+- `WidgetState.Capped` was typed `int` and set to the cap *value* (20) instead of
+  `bool` — broke the API contract silently (every response looked "capped" to a naive
+  reader, or rather, always reported the wrong kind of value).
+- Ignored errors from `redis.Set` and from the widget's own `Hit` call at the HTTP
+  handler layer — failures were swallowed and reported as success.
+- Critical security/business-logic bug: negative `count` values were accepted and fed
+  into `min(count, remaining)` unmodified. Since `min` picks whichever number is
+  smaller regardless of sign, a capped visitor could send `{"count": -20}` and
+  literally subtract from their own stored count, resetting their cap and hitting
+  again indefinitely — a complete bypass of the one hard requirement the whole
+  project started with. Fixed with an explicit `count < 1` rejection using a sentinel
+  error (`ErrInvalidCount`) checked via `errors.Is` in the handler, mapped to `400`.
+- Concept: sentinel errors + `errors.Is` as the idiomatic way to let a lower layer
+  (widget logic) communicate error *kind* up to a layer that decides HTTP status codes,
+  without coupling the two together directly.
+
+================================================================
+5. GLOBAL COUNT + ATOMICITY (Lua scripting)
+================================================================
+- Realized `WidgetState.Count` was supposed to be the *global* public count per the
+  written spec, but the implementation had been using the per-visitor tally for it
+  the whole time — required splitting into two Redis keys: a permanent global count
+  and a TTL'd per-visitor count, rather than one key serving both purposes.
+- First attempt at "add Lua for atomicity" only wrapped the *write* in a script while
+  still computing the clamped increment in Go from an earlier `MGet` snapshot — this
+  reopened the exact race condition atomicity was meant to close, just moved it.
+  Lesson: atomicity has to wrap read-compute-write as one unit; wrapping only the
+  write buys nothing if the "how much to write" decision was already made outside it.
+- Fixed by moving the read + clamp + write entirely inside one Lua script (`EVAL`),
+  parameterized via `KEYS`/`ARGV`, so two concurrent hits from the same visitor can no
+  longer both read stale state and each apply their own increment.
+- Follow-on bugs from that change:
+  - `MGET` does not return `redis.Nil` the way single-key `GET` does — missing keys
+    just show up as `nil` entries in the result slice, no top-level error. A branch
+    written assuming `errors.Is(err, redis.Nil)` after `MGet` was permanently dead
+    code.
+  - `State()` wasn't updated to match the new plain-integer storage format (it still
+    tried `json.Unmarshal` on what was now a bare number) — silently returned zero
+    state for every real visitor.
+  - `State()` also had an *unchecked* type assertion (`countResults[0].(string)`)
+    instead of the `v, ok := x.(string)` form — panicked on any visitor checking state
+    before ever hitting (the normal first interaction with the widget).
+  - The Lua script's `SET` on the session key had no expiry — the 30-day TTL
+    (matching the anon-ID cookie's lifetime) silently disappeared, making the
+    per-visitor key permanent again.
+  - Passed `LIKE_TTL_PER_ANON_ID` (a `time.Duration`, i.e. nanoseconds) directly as a
+    script argument used for `EXPIRE` — off by a factor of 1e9, would have set a TTL
+    of tens of millions of years instead of 30 days. Fixed by converting to seconds
+    explicitly before passing it in.
+- Concept: know the difference between single-key and multi-key Redis command error
+  semantics (`GET` vs `MGET`) — assuming they behave the same silently breaks error
+  handling.
+
+================================================================
+6. CSRF PROTECTION — Origin-checking middleware
+================================================================
+- Concept, worth remembering: CORS and CSRF solve different problems. CORS only
+  controls whether cross-origin JavaScript can *read* a response — it does not stop
+  the browser from *sending* a request in the first place. A malicious page can still
+  fire a cookie-carrying POST at an endpoint with no CORS headers at all; CORS being
+  absent doesn't block the request, only reading its response. That's why Origin/
+  Referer checking is a separate, necessary defense, independent of whatever CORS
+  policy (or lack of one) exists.
+- Design decisions made deliberately (not defaulted into):
+  - Checked on every route except `/health` — a health check has no cookie-driven
+    side effects, so there's nothing for a forged request to exploit there; blanket-
+    applying the check would also break non-browser callers like uptime monitors
+    that never send an `Origin` header, for zero security benefit.
+  - Rejects on both a missing `Origin` header and a mismatched one (not just
+    mismatched) — legitimate same-origin/cross-origin browser requests reliably send
+    `Origin` on state-changing requests, so "missing" is itself a signal something's
+    off (non-browser client, or an attack vector that doesn't set it).
+  - `403 Forbidden`, not `400` — went back and checked the original spec, which had
+    already specified this. `400` means "malformed request"; `403` means "understood
+    fine, just not authorized" — the correct semantics for a trust decision.
+  - Middleware ordered *before* `anonIDMiddleware` in the chain — reject cheaply
+    before spending any work (cookie issuance, future Redis calls) on a request
+    that's going to be thrown out anyway.
+  - Origin value loaded from env (`ALLOWED_ORIGIN`), validated non-empty at startup —
+    same pattern as `SECRET_KEY`. This also closes a subtle would-be bug: without
+    that validation, an unset config value defaulting to `""` could accidentally
+    match a request with no `Origin` header (`"" == ""`), silently disabling the
+    entire check.
+- Built a small `Chain(handler, middlewares...)` helper (unprompted, own initiative)
+  to compose multiple middlewares in explicit, readable order instead of nesting
+  function calls by hand (`a(b(c(handler)))`). Middlewares listed in the order they
+  should execute, first-to-run first — cleaner than manual nesting once more than
+  one middleware is involved.
+- Bug found & fixed: the rejection response's `Content-Type` header was set *after*
+  `WriteHeader(403)` was called — too late. In Go's `net/http`, headers must be set
+  before `WriteHeader`, since that call locks in and flushes the header set. Same
+  "order matters" lesson as the cookie-attribute work earlier in the project.
+- Testing implication (same category as the `Secure`-cookie/Postman issue earlier):
+  curl and Postman don't send an `Origin` header by default — every widget-route test
+  now needs `-H "Origin: <ALLOWED_ORIGIN value>"` or it gets correctly `403`'d.
+
+================================================================
+7. RATE-LIMITING — two-tier (per-visitor + per-IP), Lua-backed counter
+================================================================
+- Design: kept the compound `(anonID, IP)` limit from the spec (1/sec, tuned to 2/sec
+  in practice), but added a second, coarser IP-only limit (100/60s) as a backstop.
+  Reasoning: the compound key relies on `anonID`, which `anonIDMiddleware` freely
+  reissues to anyone who doesn't send a cookie back — so a hostile client that never
+  persists its cookie gets a fresh identity (and a fresh rate-limit budget) on every
+  single request, bypassing the per-visitor limit entirely. An IP-only limit doesn't
+  depend on the client's cooperation, closing that specific bypass. A real browser
+  cooperates automatically (persists cookies), so this only bites deliberately evasive
+  clients.
+- Chose a plain incrementing counter (Redis `INCR`-style via Lua) over a "true" token
+  bucket — the actual requirement (flat N-per-window cap) doesn't need bucket/refill
+  semantics, and the simpler mechanism generalizes cleanly: the strict "1/sec" compound
+  limit turned out to just be this same counter mechanism with `cap = 1`, so one shared
+  `checkRateLimit` helper serves both middlewares, parameterized by key/window/cap.
+- Bugs found & fixed while writing the first version of the Lua script (three
+  independent bugs, each alone enough to make *every* request fail closed):
+  - `currentRateLimit += 1` — Lua has no compound assignment operators at all; this is
+    a parse error, not a runtime one. Redis would refuse to load the script.
+  - `if currentRateLimit >= max then` with `max` still a raw `ARGV` string, never
+    passed through `tonumber`. Lua's arithmetic operators auto-coerce numeric strings,
+    but its *relational* operators (`<`, `>=`, etc.) do not — comparing a number to a
+    string with a relational operator raises a runtime error.
+  - Returned Lua `true`/`false` from the script and tried to type-assert the Go result
+    as `bool`. Redis's Lua-to-RESP conversion doesn't have a boolean type: Lua `false`
+    becomes a RESP Nil reply, Lua `true` becomes the RESP integer `1` — so the reply
+    is *never* actually a Go `bool`, and the assertion always failed. Fixed by having
+    the script return plain integers (`0`/`1`) instead, sidestepping the conversion
+    table entirely — general lesson: avoid returning Lua booleans from Redis scripts.
+  - Follow-on: even after switching to integers, `res.(int)` was still wrong for the
+    same reason `.(int64)` was required in the widget's own script earlier — Redis
+    integer replies come back through go-redis as `int64`, never plain `int`. Used the
+    `.Int()` convenience method instead of a manual type assertion, which is also
+    simpler for a single scalar reply than what the widget script needed (that one
+    returns a table, so it still needs manual `int64` assertions per element).
+  - Copy-paste bug: the per-visitor middleware initially called `checkRateLimit` with
+    the *IP-only* constants instead of its own — both limits were silently identical
+    until caught.
+- Verified deliberately, not assumed: whether this script's own `return` paths could
+  ever yield `redis.Nil` (they can't — both branches always return a literal integer,
+  unlike the internal `GET` inside the script, whose own possible Nil is already
+  absorbed by `tonumber(... or 0)` before it affects the script's output).
+- Concept: a non-nil `error` from a Redis call is not synonymous with "connection
+  problem" — script compile errors and script runtime errors (exactly the three bugs
+  above) surface through the same `error` value as network failures. Labeling error
+  messages/logs as "connection error" when the real cause could just as easily be a
+  bug in the script itself sends future debugging in the wrong direction.
+- Open design question raised, not yet resolved: should a Redis failure make the
+  rate-limiter fail *closed* (current behavior — Redis down means all traffic
+  blocked) or fail *open* (Redis down means rate-limiting is skipped, prioritizing
+  availability)? Left as a conscious open call rather than a default.
+- Middleware ordering bug found & fixed: the IP-only limit was wired to run *before*
+  CSRF in the chain, meaning a request CSRF would reject for free instead burned a
+  Redis round-trip *and* consumed a slot from that IP's shared rate-limit budget
+  first — letting an attacker exhaust a target IP's legitimate budget purely by
+  flooding it with requests that were always going to be CSRF-rejected anyway.
+  Reordered so the free check (CSRF) runs before the Redis-backed one.
+
+================================================================
+STILL OPEN / NOT YET BUILT
+================================================================
+- Full CORS response handling (`Access-Control-Allow-Origin`/`-Credentials` headers,
+  `OPTIONS` preflight support) — only the Origin-check *CSRF* side is done; actual
+  browser cross-origin `fetch()` from the blog likely still needs these to work at
+  all once a real frontend is wired up.
+- WebSocket broadcast of live count updates — not started.
+- `LikeWidget.Validate` — still a stub (`return nil` always), never actually called
+  from the HTTP handlers; slug format validation (regex) not enforced anywhere yet.
+- Fail-open vs fail-closed decision for rate-limiting on Redis failure — unresolved.
+
+================================================================
+RECURRING LESSONS (cross-cutting, worth remembering)
+================================================================
+- Trace concurrency scenarios by hand before trusting "it looks atomic" — atomicity
+  is about *where* the read-compute-write boundary is drawn, not whether Lua/locks
+  are present somewhere nearby.
+- A function signature returning a plain `error` carries no information about *kind*
+  of failure — sentinel errors + `errors.Is` is the idiomatic fix when a caller needs
+  to react differently to different failure types.
+- Default Go behaviors are usually "do nothing extra": no timeout, no cancellation,
+  no status code override, no early return — all have to be added explicitly, and
+  forgetting one is an easy, repeatable class of bug.
+- When changing a data format (JSON blob -> plain int in Redis), audit *every* reader
+  of that data, not just the writer you're actively editing.
+- Type assertions: always use the `v, ok := x.(T)` form for anything derived from
+  external/optional input (Redis replies, cookies, HTTP bodies) — the single-value
+  form panics on mismatch.
