@@ -96,9 +96,9 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	mux.Handle("GET /health", http.HandlerFunc(app.pingHandler))
-	mux.Handle("GET /widgets/{type}/{slug}", Chain(http.HandlerFunc(app.getLikeStateHandler), app.csrfMiddleware, app.anonIDMiddleware))
-	mux.Handle("POST /widgets/{type}/{slug}/hit", Chain(http.HandlerFunc(app.hitLikeHandler), app.csrfMiddleware, app.anonIDMiddleware))
+	mux.Handle("GET /health", Chain(http.HandlerFunc(app.pingHandler), app.ipRateLimitMiddleware))
+	mux.Handle("GET /widgets/{type}/{slug}", Chain(http.HandlerFunc(app.getLikeStateHandler), app.csrfMiddleware, app.ipRateLimitMiddleware, app.anonIDMiddleware, app.rateLimitMiddleware))
+	mux.Handle("POST /widgets/{type}/{slug}/hit", Chain(http.HandlerFunc(app.hitLikeHandler), app.csrfMiddleware, app.ipRateLimitMiddleware, app.anonIDMiddleware, app.rateLimitMiddleware))
 
 	if err := http.ListenAndServe(":8080", mux); err != nil {
 		fmt.Println("Error running server:", err)
