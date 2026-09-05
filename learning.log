@@ -243,15 +243,110 @@ Mentor-guided build. Log kept in reverse-chronological-topic order (by feature, 
   Reordered so the free check (CSRF) runs before the Redis-backed one.
 
 ================================================================
+8. CORS — preflight handling + response headers
+================================================================
+- Discovered by testing first: `OPTIONS /widgets/like-widget/foo` returned `405
+  Method Not Allowed`, not a 404 or a handler response. Root cause: Go 1.22+
+  `ServeMux` dispatches by exact method+pattern — no `OPTIONS` route registered
+  means the request never reaches any handler or middleware at all, including
+  whatever CORS logic might already live inside a route's `Chain`. This ruled out
+  "just add CORS headers inside the existing middleware chain" as a way to handle
+  preflight — a *separate* route/handler was required.
+- Design choice (deliberated): a single global `OPTIONS /` handler (Go's mux
+  treats a bare `/` pattern as a catch-all subtree match) instead of registering
+  an explicit `OPTIONS` route per path. Reasoning: one origin policy for the whole
+  app, small route set, and a preflight approving a path that turns out not to
+  exist is harmless — the real request still gets mux's normal 404 behavior
+  afterward. Trade-off accepted: less precise per-path `Allow-Methods` metadata,
+  but browsers only use preflight to decide *whether to send* the real request;
+  actual enforcement still happens at real-request time regardless.
+- Preflight response needs `Access-Control-Allow-Credentials: true` in addition to
+  `Access-Control-Allow-Origin`, because the real requests carry a credentialed
+  cookie — first version omitted this, would have made the browser refuse the
+  real request even after a "successful" preflight.
+- Bugs found & fixed in the preflight handler itself:
+  - No `Origin` validation at all initially — every preflight got a 200 approval
+    regardless of requester, contradicting the CSRF-equivalent 403 policy already
+    agreed on for mismatched origins.
+  - `Access-Control-Allow-Origin` was a hardcoded string literal instead of
+    `app.allowedOrigin` — config-driven design broken (changing the env var
+    wouldn't change this response), and a second, independent source of truth for
+    the same policy `csrfMiddleware` already enforces.
+  - Fixed: read `r.Header.Get("Origin")`, compare against `app.allowedOrigin`,
+    `403` on mismatch (mirrors `csrfMiddleware`'s check), only set the CORS
+    headers + `200` on match.
+- More significant bug: `corsMiddleware` (the one setting headers on *actual*,
+  non-OPTIONS responses) was originally placed *last* in each route's `Chain`.
+  Since `Chain`'s execution order matches the middleware list's order (first
+  listed = outermost = runs first, per the existing `Chain` helper), any earlier
+  middleware that short-circuited — `csrfMiddleware`'s 403, either rate-limit
+  middleware's 429 — returned before ever reaching `corsMiddleware`. Result: every
+  *rejected* request shipped back with no CORS headers at all, which browsers
+  don't just ignore — a missing/mismatched `Access-Control-Allow-Origin` makes the
+  browser refuse to let JS read the response body, turning a clean, intentional
+  403/429 into an opaque, undebuggable "network error" client-side. Fixed by
+  moving `corsMiddleware` to the front of every `Chain` list, so the header is set
+  unconditionally before any other middleware gets a chance to exit early.
+- Concept: CORS enforcement is about header presence/correctness, not status code
+  — a 403 with the right `Access-Control-Allow-Origin` is still readable by
+  browser JS; a 200 without it is not. Middleware that sets CORS headers has to
+  run *before* anything that might return early, not after.
+
+================================================================
+9. SLUG VALIDATION — format + length, as middleware
+================================================================
+- Design: validate slug *format* before validating widget-type *existence* —
+  reject cheaply (no Redis) before any lookup work. Implemented as
+  `slugValidationMiddleware`, following the same `Chain` pattern as the other
+  middlewares, wired only into the two routes that actually have a `{slug}`
+  path segment (not `/health`).
+- Regex: `^[a-z0-9]+(?:-[a-z0-9]+)*$` — lowercase alphanumeric segments joined by
+  single hyphens. Ended up stricter than the spec's original `[a-z0-9-]{1,100}`
+  pattern: also rejects leading/trailing hyphens and double hyphens, which the
+  simpler character-class version would have silently allowed.
+- Confirmed `regexp.MustCompile` at package scope (compiled once at program
+  start) is the right call over compiling per-request — `*regexp.Regexp` is safe
+  for concurrent use across goroutines, and a panic on a malformed pattern at
+  startup (fail-fast) is preferable to discovering it mid-request.
+- The length-cap requirement (max 100 chars) went through three wrong attempts
+  before landing correctly — all three were the same underlying misunderstanding
+  (a quantifier on a *group* bounds how many times that group repeats, not how
+  many characters get consumed):
+  1. First version had no length bound at all — any shape-valid string of any
+     length passed, a direct DoS surface (unbounded string ends up inside a
+     Redis key and a Lua script argument).
+  2. Changed the inner hyphen-group's quantifier from `*` to `{1,100}` — this
+     bounds the *count of hyphen-separated segments* to 1–100, not total string
+     length (a single 100-segment slug could still be enormous). It also
+     introduced a regression: `{1,100}` requires *at least one* repetition, so a
+     plain single-word slug with zero hyphens (e.g. `"cats"`) stopped matching
+     entirely — a previously-valid case broken by a fix aimed at something else.
+  3. Wrapped the *whole* original pattern in `{1,100}` instead — still didn't
+     bound length. Regex engines are greedy: the first repetition of a
+     variable-length group already consumes the entire input in one match (there's
+     no delimiter forcing an early stop), so the outer repeat count never gets
+     exercised in practice — functionally identical to no bound.
+  - Fixed by reverting the regex to the original `*` form and adding a separate,
+    explicit `len(slug) > MAX_SLUG_LENGTH` check in Go, independent of the regex
+    match. Two simple, readable conditions instead of one regex trying to encode
+    both a shape rule and a length rule.
+- Missing-`return` bug, again: the first version of the length-check branch wrote
+  the 400 response but had no `return` — fell through into the regex check and
+  then into `next.ServeHTTP` regardless of outcome. An oversized-but-otherwise-
+  valid slug got a 400 body written *and* still got passed to the real handler
+  afterward (double response write, invalid request still served) — the exact
+  same bug class as the very first fix of the whole project (`/health`, section 1),
+  resurfacing verbatim in a brand-new file. Fixed by adding the `return`
+  immediately after the length-check's error response.
+
+================================================================
 STILL OPEN / NOT YET BUILT
 ================================================================
-- Full CORS response handling (`Access-Control-Allow-Origin`/`-Credentials` headers,
-  `OPTIONS` preflight support) — only the Origin-check *CSRF* side is done; actual
-  browser cross-origin `fetch()` from the blog likely still needs these to work at
-  all once a real frontend is wired up.
 - WebSocket broadcast of live count updates — not started.
-- `LikeWidget.Validate` — still a stub (`return nil` always), never actually called
-  from the HTTP handlers; slug format validation (regex) not enforced anywhere yet.
+- `LikeWidget.Validate` — still a stub (`return nil` always), never actually
+  called from the HTTP handlers. (Slug format/length is now enforced, but via a
+  separate middleware, not through this interface method — worth revisiting
+  whether `Validate` should be removed or actually wired up.)
 - Fail-open vs fail-closed decision for rate-limiting on Redis failure — unresolved.
 
 ================================================================
@@ -271,3 +366,14 @@ RECURRING LESSONS (cross-cutting, worth remembering)
 - Type assertions: always use the `v, ok := x.(T)` form for anything derived from
   external/optional input (Redis replies, cookies, HTTP bodies) — the single-value
   form panics on mismatch.
+- "Missing `return` after writing an error response" is not a one-off bug fixed
+  once in `/health` — it resurfaced verbatim in slug validation, a completely
+  different file, much later. Treat it as a reflex to check on every early-exit
+  branch, not a solved problem tied to one piece of code.
+- A quantifier applied to a variable-length group (`{1,100}`, `*`, etc.) bounds
+  how many times that group repeats — it does not bound how many characters get
+  consumed. When the actual goal is "string no longer than N chars," reach for
+  `len()`, not a repetition count on part of the regex.
+- Middleware that must run unconditionally (setting a header every response
+  needs, e.g. CORS) has to sit *first* in the chain — anything placed after a
+  middleware that can return early will simply never execute on that request.
