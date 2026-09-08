@@ -71,6 +71,16 @@ func main() {
 		fmt.Println("[env] WARNING: No .env file is present")
 	}
 
+	port := os.Getenv("PORT")
+	if port == "" {
+		panic("[env] empty port")
+	}
+
+	redisUrl := os.Getenv("REDIS_URL")
+	if redisUrl == "" {
+		panic("[env] empty redis URL")
+	}
+
 	secretKey := os.Getenv("SECRET_KEY")
 	if secretKey == "" || len(secretKey) < 15 {
 		panic("[env] secret key is not valid")
@@ -81,7 +91,7 @@ func main() {
 		panic("[env] allowed origin is not valid")
 	}
 
-	opt, err := redis.ParseURL("redis://localhost:6379/0")
+	opt, err := redis.ParseURL(redisUrl)
 	if err != nil {
 		panic(err)
 	}
@@ -123,7 +133,7 @@ func main() {
 	mux.Handle("POST /widgets/{type}/{slug}/hit", Chain(http.HandlerFunc(app.hitLikeHandler), app.corsMiddleware, app.csrfMiddleware, app.slugValidationMiddleware, app.ipRateLimitMiddleware, app.anonIDMiddleware, app.rateLimitMiddleware))
 	mux.Handle("GET /widgets/{type}/{slug}/ws", Chain(http.HandlerFunc(app.widgetWsHandler), app.corsMiddleware, app.csrfMiddleware, app.slugValidationMiddleware, app.anonIDMiddleware))
 
-	if err := http.ListenAndServe(":8080", mux); err != nil {
+	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		fmt.Println("Error running server:", err)
 	}
 
