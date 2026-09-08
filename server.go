@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
 )
@@ -33,11 +36,18 @@ type APIWidgetResponse struct {
 	Data    *WidgetState `json:"data,omitempty"`
 }
 
+type WSWidgetMessage struct {
+	WidgetType string `json:"widgetType"`
+	Count      int    `json:"count"`
+}
+
 type Application struct {
 	redis          *redis.Client
 	secret         []byte
 	widgetRegistry WidgetsRegistry
 	allowedOrigin  string
+	wsUpgrader     websocket.Upgrader
+	clients        map[string]map[*websocket.Conn]bool
 }
 
 type ctxKey string
@@ -45,6 +55,8 @@ type ctxKey string
 type Middleware func(http.Handler) http.Handler
 
 const anonIDKey ctxKey = "anonID"
+
+var mutex = &sync.Mutex{}
 
 func Chain(h http.Handler, middlewares ...Middleware) http.Handler {
 	for i := len(middlewares) - 1; i >= 0; i-- {
@@ -79,11 +91,19 @@ func main() {
 	// Widget Registration
 	wr := NewWidgetRegistry()
 
+	clients := make(map[string]map[*websocket.Conn]bool)
+
 	app := &Application{
 		redis:          rdb,
 		secret:         []byte(secretKey),
 		widgetRegistry: wr,
 		allowedOrigin:  allowedOrigin,
+		wsUpgrader:     websocket.Upgrader{},
+		clients:        clients,
+	}
+
+	app.wsUpgrader.CheckOrigin = func(r *http.Request) bool {
+		return app.isAllowedOrigin(r)
 	}
 
 	// Like widget
@@ -101,6 +121,7 @@ func main() {
 	mux.Handle("GET /health", Chain(http.HandlerFunc(app.pingHandler), app.corsMiddleware, app.ipRateLimitMiddleware))
 	mux.Handle("GET /widgets/{type}/{slug}", Chain(http.HandlerFunc(app.getLikeStateHandler), app.corsMiddleware, app.csrfMiddleware, app.slugValidationMiddleware, app.ipRateLimitMiddleware, app.anonIDMiddleware, app.rateLimitMiddleware))
 	mux.Handle("POST /widgets/{type}/{slug}/hit", Chain(http.HandlerFunc(app.hitLikeHandler), app.corsMiddleware, app.csrfMiddleware, app.slugValidationMiddleware, app.ipRateLimitMiddleware, app.anonIDMiddleware, app.rateLimitMiddleware))
+	mux.Handle("GET /widgets/{type}/{slug}/ws", Chain(http.HandlerFunc(app.widgetWsHandler), app.corsMiddleware, app.csrfMiddleware, app.slugValidationMiddleware, app.anonIDMiddleware))
 
 	if err := http.ListenAndServe(":8080", mux); err != nil {
 		fmt.Println("Error running server:", err)
@@ -157,6 +178,7 @@ func (app *Application) hitLikeHandler(w http.ResponseWriter, r *http.Request) {
 		Data:    nil,
 	}
 
+	slug := r.PathValue("slug")
 	widgetType := r.PathValue("type")
 	widget := app.widgetRegistry.Get(widgetType)
 	if widget == nil {
@@ -180,7 +202,7 @@ func (app *Application) hitLikeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	state, err := widget.Hit(r.Context(), r.PathValue("slug"), anonID, requestBody.Count)
+	state, err := widget.Hit(r.Context(), slug, anonID, requestBody.Count)
 	if errors.Is(err, ErrInvalidCount) {
 		w.WriteHeader(http.StatusBadRequest)
 		response.Message = err.Error()
@@ -200,6 +222,21 @@ func (app *Application) hitLikeHandler(w http.ResponseWriter, r *http.Request) {
 	response.Data = &state
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(response)
+
+	mutex.Lock()
+	clients := app.clients[GenerateWidgetSlugKey(widgetType, slug)]
+
+	for client := range clients {
+		err := client.WriteJSON(WSWidgetMessage{
+			WidgetType: widgetType,
+			Count:      state.Count,
+		})
+		if err != nil {
+			client.Close()
+			delete(clients, client)
+		}
+	}
+	mutex.Unlock()
 }
 
 func (app *Application) getLikeStateHandler(w http.ResponseWriter, r *http.Request) {
@@ -238,4 +275,39 @@ func (app *Application) getLikeStateHandler(w http.ResponseWriter, r *http.Reque
 	response.Data = &state
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(response)
+}
+
+func (app *Application) widgetWsHandler(w http.ResponseWriter, r *http.Request) {
+	conn, err := app.wsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Println("[x] error " + err.Error())
+		return
+	}
+
+	defer conn.Close()
+
+	widget := r.PathValue("type")
+	slug := r.PathValue("slug")
+	key := GenerateWidgetSlugKey(widget, slug)
+
+	mutex.Lock()
+
+	if _, ok := app.clients[key]; !ok {
+		app.clients[key] = make(map[*websocket.Conn]bool)
+	}
+
+	app.clients[key][conn] = true
+	mutex.Unlock()
+
+	for {
+		_, _, err := conn.ReadMessage()
+		if err != nil {
+			mutex.Lock()
+			clients := app.clients[key]
+			delete(clients, conn)
+			mutex.Unlock()
+			break
+		}
+	}
+
 }

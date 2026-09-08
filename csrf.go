@@ -16,8 +16,8 @@ func (app *Application) corsMiddleware(next http.Handler) http.Handler {
 
 func (app *Application) csrfMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-		if origin != app.allowedOrigin {
+		allowed := app.isAllowedOrigin(r)
+		if !allowed {
 			res := APIResponse{
 				Success: false,
 				Message: "Forbidden",
@@ -31,4 +31,9 @@ func (app *Application) csrfMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (app *Application) isAllowedOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	return origin == app.allowedOrigin
 }

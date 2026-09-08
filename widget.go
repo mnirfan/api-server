@@ -29,6 +29,10 @@ type WidgetsRegistry struct {
 	widgets map[string]Widget
 }
 
+func GenerateWidgetSlugKey(widgetName string, slug string) string {
+	return widgetName + ":" + slug
+}
+
 func NewWidgetRegistry() WidgetsRegistry {
 	widgetRegistry := WidgetsRegistry{
 		widgets: make(map[string]Widget),
