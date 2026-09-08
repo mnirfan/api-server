@@ -1,0 +1,56 @@
+# This workflow will build a golang project
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
+
+name: Go
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version-file: "go.mod"
+
+    - name: Install dependencies
+      run: go get .
+
+    - name: Build binary
+      run: go build -o app-linux-amd64
+
+    - name: Test
+      run: go test -v ./...
+
+    - name: upload build result
+      run: |
+        ls -lah
+    
+    - name: Copy files via SSH
+      uses: appleboy/scp-action@v1
+      with:
+        host: ${{ secrets.VPS_HOST }}
+        username: ${{ secrets.VPS_USER }}
+        key: ${{ secrets.VPS_SSH_KEY }}
+        port: ${{ secrets.PORT }}
+        source: app-linux-amd64
+        target: ./
+
+    - name: Execute remote SSH commands using password
+      uses: appleboy/ssh-action@v1
+      with:
+        host: ${{ secrets.VPS_HOST }}
+        username: ${{ secrets.VPS_USER }}
+        key: ${{ secrets.VPS_SSH_KEY }}
+        port: ${{ secrets.PORT }}
+        script: |
+          pwd
+          ls -lah
+          sudo mv app-linux-amd64 /usr/local/bin/api-server
+          sudo systemctl restart myapp.service
