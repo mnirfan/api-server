@@ -340,14 +340,125 @@ Mentor-guided build. Log kept in reverse-chronological-topic order (by feature, 
   immediately after the length-check's error response.
 
 ================================================================
+10. WEBSOCKET BROADCAST — live count updates, in-memory connection registry
+================================================================
+- Resolved (deliberate decision, recorded not just defaulted): rate-limiting on
+  Redis failure stays fail-*closed* — matches what `checkRateLimit` already did
+  (`err != nil` -> treated as limited/blocked). Trade-off acknowledged: a Redis
+  outage takes the whole API down rather than silently disabling rate-limiting;
+  accepted as the right call for this project.
+- Design decisions made deliberately:
+  - `gorilla/websocket` for the protocol layer — Go's stdlib has no WebSocket
+    support at all.
+  - Per-slug scope, not one global broadcast — a blog page only cares about the
+    one widget instance it renders, no reason to fan out every widget's updates
+    to every connection.
+  - In-memory registry (`map[string]map[*websocket.Conn]bool`), no Redis Pub/Sub
+    — consistent with the earlier "single instance" decision from the original
+    spec discussion. A single process already holds every open connection in its
+    own memory; Pub/Sub only earns its keep once there's a second process to fan
+    out *to*. Same YAGNI reasoning as the widget-interface decision back in
+    section 3.
+  - Broadcast triggered from `hitLikeHandler` (HTTP layer), not from
+    `LikeWidget.Hit` itself — keeps the widget's dependency surface unchanged
+    (still only `*redis.Client`), same boundary reasoning as narrowing
+    `LikeWidget` away from embedding the whole `Application` back in section 3.
+  - Registry keyed by `widgetType + ":" + slug` (flat composite string), not
+    nested per-type maps — caught *before* writing any code that slug alone
+    isn't a safe key: two different widget types could share the same slug on
+    the same blog post, exactly the reason `GenerateGlobalKey`/
+    `GenerateSessionKey` already namespace their Redis keys by widget name.
+    Flat vs. nested-map memory difference judged negligible at this scale;
+    chosen for simpler locking and lookup (one map, one mutex, one hop).
+- Bugs found & fixed (roughly in order found):
+  - **Inverted helper function** — `isAllowedOrigin(r)` was written as
+    `return origin != app.allowedOrigin`, i.e. it actually returned `true` when
+    the origin *did not* match, exactly backwards from its own name. Shared
+    between two call sites with opposite needs: `csrfMiddleware` happened to
+    still work by accident (`if allowed { reject }` — "allowed" secretly meant
+    "not allowed"), but gorilla's `Upgrader.CheckOrigin` contract is `true` =
+    accept, so wired directly it rejected every legitimate same-origin
+    connection and would have accepted forged cross-origin ones — the exact
+    opposite of the intended security effect. Fixed by making the helper's
+    return value match its name (`origin == app.allowedOrigin`) and adjusting
+    `csrfMiddleware`'s condition instead.
+  - **Gorilla's default `CheckOrigin` pitfall** (learned before it could bite):
+    if `CheckOrigin` is left unset, gorilla's default compares `Origin` against
+    the request's own `Host` header — which can never equal a cross-origin
+    blog frontend's origin, so *every* legitimate connection would fail closed,
+    not just malicious ones. `CheckOrigin` isn't optional here; it has to be
+    set explicitly.
+  - **Nil map write panic** — `app.clients[key][conn] = true` where `app.clients`
+    was initialized as an empty outer map. For any `key` seen for the first
+    time, `app.clients[key]` yields the zero value of a map type, which is
+    `nil` — writing to a nil map panics at runtime. Fixed with a lazy-init
+    check (`if _, ok := app.clients[key]; !ok { app.clients[key] = make(...) }`)
+    before every write.
+  - **Connection closed immediately after registering** — an early version of
+    the WS handler registered the connection in the registry, then returned,
+    with nothing blocking. Since `Upgrade()` hijacks the raw connection from
+    `net/http`, returning from the handler doesn't itself close the socket, but
+    an even earlier version had `defer conn.Close()` right after `Upgrade`,
+    which *did* tear the connection down the instant the handler returned —
+    meaning every connection died before any broadcast could ever reach it.
+    Root issue: nothing was keeping the handler's goroutine alive for the
+    connection's actual lifetime.
+  - **Missing read loop** — even after removing the premature close, nothing
+    called `conn.ReadMessage()` at all. Consequence: client disconnects were
+    never detected server-side (no way to know the socket died until a future
+    broadcast's write happened to fail against it), and client-sent WS
+    ping/close control frames were never processed (gorilla only handles those
+    from inside `ReadMessage`/`NextReader`). Fixed by adding a loop —
+    `for { _, _, err := conn.ReadMessage(); if err != nil { ...cleanup...; break } }`
+    — at the end of the handler; the handler's own goroutine (already provided
+    for free by `net/http`, one per request) simply blocks there for the
+    connection's whole lifetime instead of returning immediately. No extra
+    goroutine, no channel needed for this — the request goroutine *is* the
+    connection's goroutine once it's hijacked.
+  - **No cleanup on disconnect** — the read loop, once added, broke out on
+    error but didn't remove the dead connection from the registry or close it.
+    Fixed by deleting the entry (under the same mutex used everywhere else) at
+    the exact point the read error is detected, plus a `defer conn.Close()`
+    right after a successful `Upgrade()` to guarantee the socket closes on
+    every exit path.
+  - **Unsynchronized map read racing a synchronized write** — in
+    `hitLikeHandler`'s broadcast code, `clients := app.clients[key]` was read
+    *before* `mutex.Lock()`, while `widgetWsHandler` only ever wrote to
+    `app.clients` *inside* the lock. Two goroutines touching the same Go map
+    without synchronization is undefined behavior — and unlike an ordinary
+    panic (which `net/http` recovers from per-request), a detected concurrent
+    map read/write is a *fatal* runtime error that takes the entire process
+    down, not just one request. Fixed by moving the lookup inside the locked
+    section, matching where the write already happened.
+- Verified, not assumed: deleting from a Go map while ranging over it (done in
+  the broadcast loop, `delete(clients, client)` on a failed write) is explicitly
+  defined-safe by the language spec — no need to collect keys first and delete
+  after the loop.
+- Noted but deliberately deferred (YAGNI, revisit only if real contention shows
+  up): a single global `mutex` guards the entire connection registry, and
+  `WriteJSON` calls happen while holding it — a slow/stuck client's blocking
+  write can momentarily stall broadcasts and connects for *every* widget, not
+  just its own slug. Two known fixes discussed and shelved: a per-write
+  `SetWriteDeadline` (bounds the stall, minimal change) or a per-connection
+  outbound channel with its own writer goroutine (fully decouples broadcast
+  from network speed, more moving parts — the standard production pattern for
+  this). Skipped for now given this project's expected connection count.
+- Concept: a WebSocket handshake is a plain HTTP request and is *not* subject to
+  the browser's Same-Origin Policy the way `fetch`/XHR are — a page from any
+  origin can attempt to open a WS connection to any server by default. CORS
+  headers do nothing to stop this. Origin validation for WS has to be enforced
+  explicitly server-side (`Upgrader.CheckOrigin`), independent of whatever CORS
+  policy exists for regular HTTP responses.
+
+================================================================
 STILL OPEN / NOT YET BUILT
 ================================================================
-- WebSocket broadcast of live count updates — not started.
 - `LikeWidget.Validate` — still a stub (`return nil` always), never actually
   called from the HTTP handlers. (Slug format/length is now enforced, but via a
   separate middleware, not through this interface method — worth revisiting
   whether `Validate` should be removed or actually wired up.)
-- Fail-open vs fail-closed decision for rate-limiting on Redis failure — unresolved.
+- Slow-WS-client write-blocking mitigation (write deadline or per-connection
+  writer goroutine) — deliberately deferred, see section 10.
 
 ================================================================
 RECURRING LESSONS (cross-cutting, worth remembering)
@@ -377,3 +488,19 @@ RECURRING LESSONS (cross-cutting, worth remembering)
 - Middleware that must run unconditionally (setting a header every response
   needs, e.g. CORS) has to sit *first* in the chain — anything placed after a
   middleware that can return early will simply never execute on that request.
+- A function's name is a promise about what its return value means — a helper
+  called `isAllowedOrigin` that actually returns "is *not* allowed" will keep
+  working by accident at one call site and invert the security decision at the
+  next. When reusing a boolean helper across call sites with different
+  expectations, re-verify what `true`/`false` mean at *each* site, don't trust
+  the name.
+- A Go map's zero value is `nil`, and a nil map is read-safe but write-unsafe —
+  `m[k]` on a missing key in a map-of-maps returns a nil inner map silently
+  (no panic), but writing into that nil map panics immediately. Any "map of
+  maps" needs an explicit exists-check-then-create before every write into the
+  inner map.
+- Concurrent, unsynchronized access to a plain Go map is worse than a normal
+  bug: the runtime can detect it and raise a *fatal* error that kills the whole
+  process, bypassing the usual per-request panic recovery `net/http` provides.
+  Every read of shared mutable state needs the same lock discipline as every
+  write to it — a lock around only the write half is not enough.
