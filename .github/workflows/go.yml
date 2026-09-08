@@ -53,4 +53,5 @@ jobs:
           pwd
           ls -lah
           sudo mv app-linux-amd64 /usr/local/bin/api-server
+          sudo systemctl daemon-reload
           sudo systemctl restart myapp.service
